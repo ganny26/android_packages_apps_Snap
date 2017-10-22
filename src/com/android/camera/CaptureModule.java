@@ -276,7 +276,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
     private ImageReader mVideoSnapshotImageReader;
     private Range mHighSpeedFPSRange;
     private boolean mHighSpeedCapture = false;
-    private boolean mHighSpeedCaptureSlowMode = false; //HFR
+    private boolean mHighSpeedRecordingMode = false; //HFR
     private int mHighSpeedCaptureRate;
 
     private static final int SELFIE_FLASH_DURATION = 680;
@@ -540,11 +540,10 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
                 Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
                 Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
                 Log.d(TAG, "STATE_WAITING_AF_LOCK id: " + id + " afState:" + afState + " aeState:" + aeState);
+
                 // AF_PASSIVE is added for continous auto focus mode
                 if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
                         CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState ||
-                        CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED == afState ||
-                        CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED == afState ||
                         (mLockRequestHashCode[id] == result.getRequest().hashCode() &&
                                 afState == CaptureResult.CONTROL_AF_STATE_INACTIVE)) {
                     if(id == MONO_ID && getCameraMode() == DUAL_MODE && isBackCamera()) {
@@ -555,15 +554,20 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
                         else
                             mState[id] = STATE_WAITING_AE_LOCK;
                     } else {
-                        runPrecaptureSequence(id);
-                        // CONTROL_AE_STATE can be null on some devices
-                        if(aeState == null || (aeState == CaptureResult
-                                .CONTROL_AE_STATE_CONVERGED) && isFlashOff(id)) {
-                            lockExposure(id);
-                        } else {
-                            runPrecaptureSequence(id);
+                        if ((mLockRequestHashCode[id] == result.getRequest().hashCode()) || (mLockRequestHashCode[id] == 0)) {
+
+                            // CONTROL_AE_STATE can be null on some devices
+                            if(aeState == null || (aeState == CaptureResult
+                                    .CONTROL_AE_STATE_CONVERGED) && isFlashOff(id)) {
+                                lockExposure(id);
+                            } else {
+                                runPrecaptureSequence(id);
+                            }
                         }
                     }
+                } else if (mLockRequestHashCode[id] == result.getRequest().hashCode()){
+                    Log.i(TAG, "AF lock request result received, but not focused");
+                    mLockRequestHashCode[id] = 0;
                 }
                 break;
             }
@@ -574,13 +578,18 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
                 Log.d(TAG, "STATE_WAITING_PRECAPTURE id: " + id + " afState: " + afState + " aeState:" + aeState);
                 if (aeState == null ||
                         aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
-                        aeState == CaptureResult.CONTROL_AE_PRECAPTURE_TRIGGER_START ||
                         aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
                         aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
-                    if (mPrecaptureRequestHashCode[id] == result.getRequest().hashCode()) {
-                        Log.d(TAG, "updateCaptureStateMachine: hashes are equal, lock exposure");
-                        lockExposure(id);
+                    if ((mPrecaptureRequestHashCode[id] == result.getRequest().hashCode()) || (mPrecaptureRequestHashCode[id] == 0)) {
+                        if (mLongshotActive && isFlashOn(id)) {
+                            checkAfAeStatesAndCapture(id);
+                        } else {
+                            lockExposure(id);
+                        }
                     }
+                } else if (mPrecaptureRequestHashCode[id] == result.getRequest().hashCode()) {
+                    Log.i(TAG, "AE trigger request result received, but not converged");
+                    mPrecaptureRequestHashCode[id] = 0;
                 }
                 break;
             }
@@ -629,6 +638,11 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             mState[id] = STATE_PICTURE_TAKEN;
             captureStillPicture(id);
         }
+    }
+
+    public void unRegisterSettingsListener(){
+        mSettingsManager.unregisterListener(this);
+        mSettingsManager.unregisterListener(mUI);
     }
 
     public void startFaceDetection() {
@@ -1036,6 +1050,14 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             if(id == MONO_ID && !canStartMonoPreview()) {
                 mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id]
                         .build(), mCaptureCallback, mCameraHandler);
+            } else {
+                // for longshot flash, need to re-configure the preview flash mode.
+                if (mLongshotActive && isFlashOn(id)) {
+                    mCaptureSession[id].stopRepeating();
+                    applyFlash(mPreviewRequestBuilder[id], id);
+                    mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id]
+                                            .build(), mCaptureCallback, mCameraHandler);
+                }
             }
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -1045,6 +1067,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
         if (mState[id] == STATE_WAITING_TOUCH_FOCUS) {
             mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, mCameraId[id]);
             mState[id] = STATE_WAITING_AF_LOCK;
+            mLockRequestHashCode[id] = 0;
             return;
         }
 
@@ -1081,6 +1104,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             setAFModeToPreview(id, mControlAFMode);
             Message message = mCameraHandler.obtainMessage(
                     CANCEL_TOUCH_FOCUS, Integer.valueOf(mCameraId[id]), 0);
+            message.arg1 = id;
             mCameraHandler.sendMessageDelayed(message, CANCEL_TOUCH_FOCUS_DELAY);
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -1158,10 +1182,12 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
 
             Location location = mLocationManager.getCurrentLocation();
             if(location != null) {
-                Log.d(TAG, "captureStillPicture gps: " + location.toString());
+                // make copy so that we don't alter the saved location since we may re-use it
+                location = new Location(location);
                 // workaround for Google bug. Need to convert timestamp from ms -> sec
                 location.setTime(location.getTime()/1000);
                 captureBuilder.set(CaptureRequest.JPEG_GPS_LOCATION, location);
+                Log.d(TAG, "captureStillPicture gps: " + location.toString());
             } else {
                 Log.d(TAG, "captureStillPicture no location - getRecordLocation: " + getRecordLocation());
             }
@@ -1298,6 +1324,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             applySettingsForPrecapture(builder, id);
             CaptureRequest request = builder.build();
             mPrecaptureRequestHashCode[id] = request.hashCode();
+
             mState[id] = STATE_WAITING_PRECAPTURE;
             mCaptureSession[id].capture(request, mCaptureCallback, mCameraHandler);
         } catch (CameraAccessException e) {
@@ -1322,7 +1349,17 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
         CameraManager manager = (CameraManager) mActivity.getSystemService(Context.CAMERA_SERVICE);
         try {
             String[] cameraIdList = manager.getCameraIdList();
-            for (int i = 0; i < cameraIdList.length; i++) {
+            int cameraIdListLength = cameraIdList.length;
+
+            if (cameraIdListLength > MAX_NUM_CAM)
+                Log.w(TAG, "Number of available cameras (" + cameraIdListLength + ") exceeds "
+                        + "max supported cameras (" + MAX_NUM_CAM + ")");
+
+            for (int i = 0; i < cameraIdListLength; i++) {
+                if (i >= MAX_NUM_CAM) {
+                    Log.w(TAG, "Skipping set up for camera with id " + i);
+                    break;
+                }
                 String cameraId = cameraIdList[i];
 
                 CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
@@ -1758,6 +1795,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             mState[i] = STATE_PREVIEW;
         }
         mLongshotActive = false;
+        mZoomValue = 1.0f;
     }
 
     private void setCurrentMode() {
@@ -2258,13 +2296,11 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
     private void updatePictureSize() {
         String pictureSize = mSettingsManager.getValue(SettingsManager.KEY_PICTURE_SIZE);
         mPictureSize = parsePictureSize(pictureSize);
-        Point screenSize = new Point();
-        mActivity.getWindowManager().getDefaultDisplay().getSize(screenSize);
         Size[] prevSizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(),
                 SurfaceHolder.class);
-        mPreviewSize = getOptimalPreviewSize(mPictureSize, prevSizes, screenSize.x, screenSize.y);
+        mPreviewSize = getOptimalPreviewSize(mPictureSize, prevSizes);
         Size[] thumbSizes = mSettingsManager.getSupportedThumbnailSizes(getMainCameraId());
-        mPictureThumbSize = getOptimalPreviewSize(mPictureSize, thumbSizes, 0, 0); // get largest thumb size
+        mPictureThumbSize = getOptimalPreviewSize(mPictureSize, thumbSizes); // get largest thumb size
     }
 
     public boolean isRecordingVideo() {
@@ -2286,23 +2322,22 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
     private void updateVideoSize() {
         String videoSize = mSettingsManager.getValue(SettingsManager.KEY_VIDEO_QUALITY);
         mVideoSize = parsePictureSize(videoSize);
-        Point screenSize = new Point();
-        mActivity.getWindowManager().getDefaultDisplay().getSize(screenSize);
         Size[] prevSizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(),
                 MediaRecorder.class);
-        mVideoPreviewSize = getOptimalPreviewSize(mVideoSize, prevSizes, screenSize.x, screenSize.y);
+        mVideoPreviewSize = getOptimalPreviewSize(mVideoSize, prevSizes);
     }
 
     private void updateVideoSnapshotSize() {
-        String auto = mSettingsManager.getValue(SettingsManager.KEY_AUTO_VIDEOSNAP_SIZE);
-        if (auto != null && auto.equals("enable")) {
-            Size[] sizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(), ImageFormat.JPEG);
-            mVideoSnapshotSize = getMaxSizeWithRatio(sizes, mVideoSize);
-        } else {
-            mVideoSnapshotSize = mPictureSize;
+        mVideoSnapshotSize = mVideoSize;
+        if (is4kSize(mVideoSize) && is4kSize(mVideoSnapshotSize)) {
+            mVideoSnapshotSize = getMaxPictureSizeLessThan4k();
         }
         Size[] thumbSizes = mSettingsManager.getSupportedThumbnailSizes(getMainCameraId());
-        mVideoSnapshotThumbSize = getOptimalPreviewSize(mVideoSnapshotSize, thumbSizes, 0, 0); // get largest thumb size
+        mVideoSnapshotThumbSize = getOptimalPreviewSize(mVideoSnapshotSize, thumbSizes); // get largest thumb size
+    }
+
+    private boolean is4kSize(Size size) {
+        return (size.getHeight() >= 2160 || size.getWidth() >= 3840);
     }
 
     private void updateMaxVideoDuration() {
@@ -2462,7 +2497,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
         } else {
             mHighSpeedCapture = true;
             String mode = value.substring(0, 3);
-            mHighSpeedCaptureSlowMode = mode.equals("hsr");
+            mHighSpeedRecordingMode = mode.equals("hsr");
             mHighSpeedCaptureRate = Integer.parseInt(value.substring(3));
         }
     }
@@ -2626,7 +2661,7 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             size = CameraSettings.getTimeLapseQualityFor(size);
         }
         updateHFRSetting();
-        boolean hfr = mHighSpeedCapture && !mHighSpeedCaptureSlowMode;
+        boolean hfr = mHighSpeedCapture && !mHighSpeedRecordingMode;
         mProfile = CamcorderProfile.get(cameraId, size);
 
         int videoEncoder = SettingTranslation
@@ -2634,15 +2669,18 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
         int audioEncoder = SettingTranslation
                 .getAudioEncoder(mSettingsManager.getValue(SettingsManager.KEY_AUDIO_ENCODER));
 
-        int outputFormat = MediaRecorder.OutputFormat.MPEG_4;
-
+        mProfile.videoCodec = videoEncoder;
         if (!mCaptureTimeLapse && !hfr) {
             mMediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            mProfile.audioCodec = audioEncoder;
+            if (mProfile.audioCodec == MediaRecorder.AudioEncoder.AMR_NB) {
+                mProfile.fileFormat = MediaRecorder.OutputFormat.THREE_GPP;
+            }
         }
         mMediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
 
         mMediaRecorder.setOutputFormat(mProfile.fileFormat);
-        String fileName = generateVideoFilename(outputFormat);
+        String fileName = generateVideoFilename(mProfile.fileFormat);
         Log.v(TAG, "New video filename: " + fileName);
         mMediaRecorder.setOutputFile(fileName);
         mMediaRecorder.setVideoFrameRate(mProfile.videoFrameRate);
@@ -2660,6 +2698,9 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             mMediaRecorder.setAudioEncoder(audioEncoder);
         }
         mMediaRecorder.setMaxDuration(mMaxVideoDurationInMs);
+
+        Log.i(TAG, "Profile video bitrate: "+ mProfile.videoBitRate);
+        Log.i(TAG, "Profile video frame rate: "+ mProfile.videoFrameRate);
         if (mCaptureTimeLapse) {
             double fps = 1000 / (double) mTimeBetweenTimeLapseFrameCaptureMs;
             mMediaRecorder.setCaptureRate(fps);
@@ -2667,14 +2708,11 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
             mHighSpeedFPSRange = new Range(mHighSpeedCaptureRate, mHighSpeedCaptureRate);
             int fps = (int) mHighSpeedFPSRange.getUpper();
             mMediaRecorder.setCaptureRate(fps);
-            if (mHighSpeedCaptureSlowMode) {
-                mMediaRecorder.setVideoFrameRate(30);
-            } else {
-                mMediaRecorder.setVideoFrameRate(fps);
-            }
-
-            int scaledBitrate = mProfile.videoBitRate * fps / mProfile.videoFrameRate;
-            Log.i(TAG, "Scaled Video bitrate : " + scaledBitrate);
+            int targetRate = mHighSpeedRecordingMode ? fps : 30;
+            mMediaRecorder.setVideoFrameRate(targetRate);
+            Log.i(TAG, "Capture rate: "+fps+", Target rate: "+targetRate);
+            int scaledBitrate = mSettingsManager.getHighSpeedVideoEncoderBitRate(mProfile, targetRate);
+            Log.i(TAG, "Scaled video bitrate : " + scaledBitrate);
             mMediaRecorder.setVideoEncodingBitRate(scaledBitrate);
         }
 
@@ -2848,6 +2886,11 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
     private boolean isFlashOff(int id) {
         if (!mSettingsManager.isFlashSupported(id)) return true;
         return mSettingsManager.getValue(SettingsManager.KEY_FLASH_MODE).equals("1");
+    }
+
+    private boolean isFlashOn(int id) {
+        if (!mSettingsManager.isFlashSupported(id)) return false;
+        return mSettingsManager.getValue(SettingsManager.KEY_FLASH_MODE).equals("on");
     }
 
     private void initializePreviewConfiguration(int id) {
@@ -3349,37 +3392,44 @@ public class CaptureModule extends BaseModule<CaptureUI> implements PhotoControl
         }
     }
 
-    private Size getOptimalPreviewSize(Size pictureSize, Size[] prevSizes, int screenW, int
-            screenH) {
-        if (pictureSize.getWidth() <= screenH && pictureSize.getHeight() <= screenW) {
-            return pictureSize;
+    private Size getOptimalPreviewSize(Size pictureSize, Size[] prevSizes) {
+        Point[] points = new Point[prevSizes.length];
+
+        double targetRatio = (double) pictureSize.getWidth() / pictureSize.getHeight();
+        int index = 0;
+        for (Size s : prevSizes) {
+            points[index++] = new Point(s.getWidth(), s.getHeight());
         }
-        Size optimal = prevSizes[0];
-        float ratio = (float) pictureSize.getWidth() / pictureSize.getHeight();
-        for (Size prevSize: prevSizes) {
-            float prevRatio = (float) prevSize.getWidth() / prevSize.getHeight();
-            if (Math.abs(prevRatio - ratio) < 0.01) {
-                // flip w and h
-                if (prevSize.getWidth() <= screenH && prevSize.getHeight() <= screenW &&
-                        prevSize.getWidth() <= pictureSize.getWidth() && prevSize.getHeight() <= pictureSize.getHeight()) {
-                    return prevSize;
-                } else {
-                    optimal = prevSize;
+
+        int optimalPickIndex = CameraUtil.getOptimalPreviewSize(mActivity, points, targetRatio);
+        return (optimalPickIndex == -1) ? null : prevSizes[optimalPickIndex];
+    }
+
+    private Size getMaxPictureSizeLessThan4k() {
+        Size[] sizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(), ImageFormat.JPEG);
+        float ratio = (float) mVideoSize.getWidth() / mVideoSize.getHeight();
+        Size optimalSize = null;
+        for (Size size : sizes) {
+            if (is4kSize(size)) continue;
+            float pictureRatio = (float) size.getWidth() / size.getHeight();
+            if (Math.abs(pictureRatio - ratio) > 0.01) continue;
+            if (optimalSize == null || size.getWidth() > optimalSize.getWidth()) {
+                optimalSize = size;
+            }
+        }
+
+        // Cannot find one that matches the aspect ratio. This should not happen.
+        // Ignore the requirement.
+        if (optimalSize == null) {
+            Log.w(TAG, "No picture size match the aspect ratio");
+            for (Size size : sizes) {
+                if (is4kSize(size)) continue;
+                if (optimalSize == null || size.getWidth() > optimalSize.getWidth()) {
+                    optimalSize = size;
                 }
             }
         }
-        return optimal;
-    }
-
-    private Size getMaxSizeWithRatio(Size[] sizes, Size reference) {
-        float ratio = (float) reference.getWidth() / reference.getHeight();
-        for (Size size : sizes) {
-            float prevRatio = (float) size.getWidth() / size.getHeight();
-            if (Math.abs(prevRatio - ratio) < 0.01) {
-                return size;
-            }
-        }
-        return sizes[0];
+        return optimalSize;
     }
 
     public TrackingFocusRenderer getTrackingForcusRenderer() {

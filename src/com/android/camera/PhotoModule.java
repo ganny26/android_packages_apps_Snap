@@ -289,6 +289,7 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
     private boolean mMirror;
     private boolean mFirstTimeInitialized;
     private boolean mIsImageCaptureIntent;
+    private int mOrientationOffset;
 
     private int mCameraState = INIT;
     private boolean mSnapshotOnIdle = false;
@@ -556,6 +557,7 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
     public void init(CameraActivity activity, View parent) {
         mActivity = activity;
         mRootView = parent;
+        mOrientationOffset = CameraUtil.isDefaultToPortrait(mActivity) ? 0 : 90;
         mPreferences = ComboPreferences.get(mActivity);
         if (mPreferences == null) {
             mPreferences = new ComboPreferences(mActivity);
@@ -619,7 +621,7 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
     private void locationFirstRun() {
         /* Do not prompt if the preference is already set, this is a secure
          * camera session, or the prompt has already been triggered. */
-        if (RecordLocationPreference.isSet(mPreferences) ||
+        if (RecordLocationPreference.isSet(mPreferences, CameraSettings.KEY_RECORD_LOCATION) ||
                 mActivity.isSecureCamera() || mLocationPromptTriggered) {
             return;
         }
@@ -902,7 +904,8 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         }
 
         // Initialize location service.
-        boolean recordLocation = RecordLocationPreference.get(mPreferences);
+        boolean recordLocation = RecordLocationPreference.get(mPreferences,
+                CameraSettings.KEY_RECORD_LOCATION);
         mLocationManager.recordLocation(recordLocation);
 
         mUI.initializeFirstTime();
@@ -925,7 +928,8 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
     // onResume.
     private void initializeSecondTime() {
         // Start location update if needed.
-        boolean recordLocation = RecordLocationPreference.get(mPreferences);
+        boolean recordLocation = RecordLocationPreference.get(mPreferences,
+                CameraSettings.KEY_RECORD_LOCATION);
         mLocationManager.recordLocation(recordLocation);
         MediaSaveService s = mActivity.getMediaSaveService();
         if (s != null) {
@@ -1258,10 +1262,17 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         }
     }
 
-    private byte[] flipJpeg(byte[] jpegData) {
+    private byte[] flipJpeg(byte[] jpegData, int orientation, int jpegOrientation) {
         Bitmap srcBitmap = BitmapFactory.decodeByteArray(jpegData, 0, jpegData.length);
         Matrix m = new Matrix();
-        m.preScale(-1, 1);
+        if(orientation == 270 || orientation == 90) {
+            // Judge whether the picture or phone is horizontal screen
+            if (jpegOrientation == 0 || jpegOrientation == 180) {
+                m.preScale(-1, 1);
+            } else { // the picture or phone is Vertical screen
+                m.preScale(1, -1);
+            }
+        }
         Bitmap dstBitmap = Bitmap.createBitmap(srcBitmap, 0, 0, srcBitmap.getWidth(), srcBitmap.getHeight(), m, false);
         dstBitmap.setDensity(DisplayMetrics.DENSITY_DEFAULT);
         int size = dstBitmap.getWidth() * dstBitmap.getHeight();
@@ -1269,6 +1280,18 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         dstBitmap.compress(Bitmap.CompressFormat.JPEG, 100, outStream);
 
         return outStream.toByteArray();
+    }
+
+    public static byte[] addExifTags(byte[] jpeg, int orientationInDegree) {
+        ExifInterface exif = new ExifInterface();
+        exif.addOrientationTag(orientationInDegree);
+        ByteArrayOutputStream jpegOut = new ByteArrayOutputStream();
+        try {
+            exif.writeExif(jpeg, jpegOut);
+        } catch (IOException e) {
+            Log.e(TAG, "Could not write EXIF", e);
+        }
+        return jpegOut.toByteArray();
     }
 
     private final class JpegPictureCallback
@@ -1359,16 +1382,21 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
 
             boolean backCameraRestartPreviewOnPictureTaken = false;
             boolean frontCameraRestartPreviewOnPictureTaken = false;
+            boolean additionalCameraRestartPreviewOnPictureTaken = false;
             backCameraRestartPreviewOnPictureTaken =
                     mActivity.getResources().getBoolean(R.bool.back_camera_restart_preview_onPictureTaken);
             frontCameraRestartPreviewOnPictureTaken =
                     mActivity.getResources().getBoolean(R.bool.front_camera_restart_preview_onPictureTaken);
+            additionalCameraRestartPreviewOnPictureTaken =
+                    mActivity.getResources().getBoolean(R.bool.additional_camera_restart_preview_onPictureTaken);
 
             CameraInfo info = CameraHolder.instance().getCameraInfo()[mCameraId];
             if ((info.facing == CameraInfo.CAMERA_FACING_BACK
                     && backCameraRestartPreviewOnPictureTaken && (mCameraState != LONGSHOT))
                     || (info.facing == CameraInfo.CAMERA_FACING_FRONT
-                    && frontCameraRestartPreviewOnPictureTaken && (mCameraState != LONGSHOT))) {
+                    && frontCameraRestartPreviewOnPictureTaken && (mCameraState != LONGSHOT))
+                    || (info.facing > CameraInfo.CAMERA_FACING_FRONT
+                    && additionalCameraRestartPreviewOnPictureTaken && (mCameraState != LONGSHOT))) {
                 needRestartPreview = true;
             }
 
@@ -1411,9 +1439,8 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
                             .findPreference(CameraSettings.KEY_SELFIE_MIRROR);
                     if (selfieMirrorPref != null && selfieMirrorPref.getValue() != null &&
                             selfieMirrorPref.getValue().equalsIgnoreCase("enable")) {
-                        jpegData = flipJpeg(jpegData);
-                        exif = Exif.getExif(jpegData);
-                        exif.addOrientationTag(orientation);
+                        jpegData = flipJpeg(jpegData, info.orientation, orientation);
+                        jpegData = addExifTags(jpegData, orientation);
                     }
                 }
                 if (!mIsImageCaptureIntent) {
@@ -1702,7 +1729,7 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         }
 
         // Set rotation and gps data.
-        int orientation = mOrientation;
+        int orientation = (mOrientation + mOrientationOffset) % 360;
         mJpegRotation = CameraUtil.getJpegRotation(mCameraId, orientation);
         String pictureFormat = mParameters.get(KEY_PICTURE_FORMAT);
         Location loc = getLocationAccordPictureFormat(pictureFormat);
@@ -2179,6 +2206,7 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         // the camera then point the camera to floor or sky, we still have
         // the correct orientation.
         if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) return;
+        orientation = (orientation - mOrientationOffset + 360) % 360;
         int oldOrientation = mOrientation;
         mOrientation = CameraUtil.roundOrientation(orientation, mOrientation);
         if (oldOrientation != mOrientation) {
@@ -4750,7 +4778,8 @@ public class PhotoModule extends BaseModule<PhotoUI> implements
         // ignore the events after "onPause()"
         if (mPaused) return;
 
-        boolean recordLocation = RecordLocationPreference.get(mPreferences);
+        boolean recordLocation = RecordLocationPreference.get(mPreferences,
+                CameraSettings.KEY_RECORD_LOCATION);
         mLocationManager.recordLocation(recordLocation);
         if(needRestart()){
             Log.v(TAG, "Restarting Preview... Camera Mode Changed");

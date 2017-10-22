@@ -383,18 +383,22 @@ public class CameraUtil {
         android.hardware.camera2.CameraManager manager = (android.hardware.camera2.CameraManager)context.getSystemService(Context.CAMERA_SERVICE);
 
         try {
-            CameraCharacteristics characteristics = manager.getCameraCharacteristics(manager.getCameraIdList()[0]);
-            int deviceLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+            String[] cameraIds = manager.getCameraIdList();
 
-            switch (deviceLevel) {
-                case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED:
-                    return true;
-                case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL:
-                    return true;
-                case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3:
-                    return true;
-                default:
-                    return false;
+            if (cameraIds != null && cameraIds.length > 0) {
+                CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraIds[0]);
+                int deviceLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+
+                switch (deviceLevel) {
+                    case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED:
+                        return true;
+                    case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL:
+                        return true;
+                    case CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3:
+                        return true;
+                    default:
+                        return false;
+                }
             }
         } catch(CameraAccessException | NumberFormatException e) {
             Log.e(TAG, "exception trying to get camera characteristics");
@@ -624,9 +628,18 @@ public class CameraUtil {
             Point size = sizes[i];
             double ratio = (double) size.x / size.y;
             if (Math.abs(ratio - targetRatio) > ASPECT_TOLERANCE) continue;
-            if (Math.abs(size.y - targetHeight) < minDiff) {
+
+            double heightDiff = Math.abs(size.y - targetHeight);
+            if (heightDiff < minDiff) {
                 optimalSizeIndex = i;
                 minDiff = Math.abs(size.y - targetHeight);
+            } else if (heightDiff == minDiff) {
+                // Prefer resolutions smaller-than-display when an equally close
+                // larger-than-display resolution is available
+                if (size.y < targetHeight) {
+                    optimalSizeIndex = i;
+                    minDiff = heightDiff;
+                }
             }
         }
         // Cannot find the one match the aspect ratio. This should not happen.
